@@ -1,9 +1,11 @@
-"""Find senders of '↓ Unimportant'-labeled mail without an existing Gmail filter, and create filters for them."""
+"""Find senders of labeled mail without an existing Gmail filter, and create filters for them."""
 
 import argparse
 import csv
 import os
+import re
 import sys
+import time
 from email.utils import parseaddr
 
 from google.auth.transport.requests import Request
@@ -18,74 +20,144 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.labels",
 ]
 
-LABEL_NAME = "↓ Unimportant"
-TIME_WINDOW = "newer_than:14d"
+DEFAULT_LABEL = "↓ Unimportant"
+DEFAULT_WINDOW = "newer_than:14d"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CREDS_PATH = os.path.join(HERE, "credentials.json")
-TOKEN_PATH = os.path.join(HERE, "token.json")
-SENDERS_CSV = os.path.join(HERE, "senders.csv")
-DIFF_CSV = os.path.join(HERE, "diff.csv")
+DEFAULT_CREDS = os.path.join(HERE, "credentials.json")
+DEFAULT_TOKEN = os.path.join(HERE, "token.json")
+
+RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
-def authenticate():
+def _retry(call, max_attempts=5, base_delay=1.0):
+    """Execute call() with exponential backoff on transient Gmail API errors."""
+    for attempt in range(max_attempts):
+        try:
+            return call()
+        except HttpError as e:
+            status = getattr(getattr(e, "resp", None), "status", None)
+            if status in RETRY_STATUSES and attempt < max_attempts - 1:
+                time.sleep(base_delay * (2 ** attempt))
+                continue
+            raise
+
+
+def authenticate(creds_path, token_path, allow_browser_flow=True):
     creds = None
-    if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            if not os.path.exists(CREDS_PATH):
+            if not allow_browser_flow:
                 sys.exit(
-                    f"Missing {CREDS_PATH}. Download OAuth client (Desktop) JSON "
-                    "from Google Cloud Console and save it as credentials.json."
+                    f"Interactive OAuth required but --no-auth-flow is set. "
+                    f"Run interactively once to refresh {token_path}."
                 )
-            flow = InstalledAppFlow.from_client_secrets_file(CREDS_PATH, SCOPES)
+            if not os.path.exists(creds_path):
+                sys.exit(
+                    f"Missing {creds_path}. Download OAuth client (Desktop) JSON "
+                    "from Google Cloud Console."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
             creds = flow.run_local_server(port=0)
-        with open(TOKEN_PATH, "w") as f:
+        with open(token_path, "w") as f:
             f.write(creds.to_json())
     return build("gmail", "v1", credentials=creds)
 
 
+def parse_from_criterion(from_val):
+    """Parse a Gmail filter 'from' criterion into (exact_emails, domains).
+
+    exact_emails: addresses that must match the sender exactly (e.g. billing@example.com).
+    domains:      domains where any sender at that domain is covered (e.g. example.com).
+
+    Domain-style coverage is added only for tokens that explicitly look like a domain
+    filter ('@example.com' or bare 'example.com'). An exact-address filter like
+    'billing@example.com' does NOT add example.com to the domain set.
+    """
+    exact_emails = set()
+    domains = set()
+
+    if not from_val:
+        return exact_emails, domains
+
+    val = from_val
+    for ch in '(){},|"\'':
+        val = val.replace(ch, " ")
+    val = re.sub(r"\bOR\b", " ", val, flags=re.IGNORECASE)
+
+    for raw in val.split():
+        t = raw.strip().lower()
+        if not t or t.startswith("-"):
+            continue
+        if t.startswith("@"):
+            dom = t[1:]
+            if dom and "." in dom:
+                domains.add(dom)
+        elif "@" in t:
+            local, _, dom = t.partition("@")
+            if local and dom:
+                exact_emails.add(t)
+        elif "." in t:
+            domains.add(t)
+
+    return exact_emails, domains
+
+
+def collect_filter_targets(filters):
+    """Aggregate exact emails and domains across every filter's 'from' criterion."""
+    all_exact = set()
+    all_domains = set()
+    for f in filters:
+        exact, domains = parse_from_criterion(f.get("criteria", {}).get("from", ""))
+        all_exact |= exact
+        all_domains |= domains
+    return all_exact, all_domains
+
+
+def is_sender_filtered(email, exact_emails, domains):
+    if email in exact_emails:
+        return True
+    if "@" in email:
+        if email.split("@", 1)[1] in domains:
+            return True
+    return False
+
+
 def find_label_id(svc, name):
-    labels = svc.users().labels().list(userId="me").execute().get("labels", [])
+    labels = _retry(lambda: svc.users().labels().list(userId="me").execute()).get("labels", [])
     for l in labels:
         if l["name"] == name:
             return l["id"]
     sys.exit(f"Label '{name}' not found in account.")
 
 
-def fetch_senders(svc, label_id):
-    """Return dict: lowercase_email -> {'email': email, 'count': n, 'sample_subject': str}."""
+def fetch_senders(svc, label_id, window):
     senders = {}
     page_token = None
     n = 0
     while True:
-        resp = (
-            svc.users()
-            .messages()
-            .list(
+        resp = _retry(
+            lambda: svc.users().messages().list(
                 userId="me",
                 labelIds=[label_id],
-                q=TIME_WINDOW,
+                q=window,
                 pageToken=page_token,
                 maxResults=500,
-            )
-            .execute()
+            ).execute()
         )
         msgs = resp.get("messages", [])
         for m in msgs:
-            full = (
-                svc.users()
-                .messages()
-                .get(
+            full = _retry(
+                lambda mid=m["id"]: svc.users().messages().get(
                     userId="me",
-                    id=m["id"],
+                    id=mid,
                     format="metadata",
                     metadataHeaders=["From", "Subject"],
-                )
-                .execute()
+                ).execute()
             )
             headers = {h["name"]: h["value"] for h in full.get("payload", {}).get("headers", [])}
             _, addr = parseaddr(headers.get("From", ""))
@@ -108,105 +180,84 @@ def fetch_senders(svc, label_id):
 
 
 def fetch_existing_filters(svc):
-    """Return list of filter dicts."""
-    resp = svc.users().settings().filters().list(userId="me").execute()
-    return resp.get("filter", [])
-
-
-def existing_from_emails(filters):
-    """Return set of lowercase email addresses appearing in any filter's 'from' criterion."""
-    emails = set()
-    for f in filters:
-        crit = f.get("criteria", {})
-        from_val = crit.get("from", "")
-        if not from_val:
-            continue
-        # Filter "from" can be a single address, a list with OR, or contain partial matches.
-        # Extract anything that looks like an email and normalize.
-        tokens = (
-            from_val.replace("(", " ")
-            .replace(")", " ")
-            .replace("{", " ")
-            .replace("}", " ")
-            .replace(",", " ")
-            .replace("|", " ")
-            .replace("OR", " ")
-            .split()
-        )
-        for t in tokens:
-            t = t.strip().strip('"').strip("'").lower()
-            if not t or t.startswith("-"):
-                continue
-            if "@" in t:
-                emails.add(t)
-                # Also store the bare domain form so '@domain.com' matches by-domain checks.
-                domain = t.split("@", 1)[1]
-                if domain and "." in domain:
-                    emails.add(domain)
-            elif "." in t:
-                # Bare domain filter like "amazon.com"
-                emails.add(t)
-    return emails
-
-
-def sender_already_filtered(email, filter_emails):
-    """A sender is considered already filtered if their exact email appears, OR their domain appears."""
-    if email in filter_emails:
-        return True
-    domain = email.split("@", 1)[1] if "@" in email else ""
-    if domain and domain in filter_emails:
-        return True
-    return False
+    return _retry(
+        lambda: svc.users().settings().filters().list(userId="me").execute()
+    ).get("filter", [])
 
 
 def create_filter(svc, email, label_id):
     body = {
         "criteria": {"from": email},
-        "action": {
-            "addLabelIds": [label_id],
-            "removeLabelIds": ["INBOX"],
-        },
+        "action": {"addLabelIds": [label_id], "removeLabelIds": ["INBOX"]},
     }
-    return svc.users().settings().filters().create(userId="me", body=body).execute()
+    return _retry(
+        lambda: svc.users().settings().filters().create(userId="me", body=body).execute()
+    )
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--label", default=DEFAULT_LABEL,
+                   help=f"Label name to scan. Default: {DEFAULT_LABEL!r}")
+    p.add_argument("--window", default=DEFAULT_WINDOW,
+                   help=f"Gmail search window. Default: {DEFAULT_WINDOW!r}")
+    p.add_argument("--credentials", default=DEFAULT_CREDS,
+                   help="Path to OAuth client JSON.")
+    p.add_argument("--token", default=DEFAULT_TOKEN,
+                   help="Path to cached token JSON.")
+    p.add_argument("--output-dir", default=HERE,
+                   help="Where senders.csv and diff.csv are written.")
+    p.add_argument("--apply", action="store_true",
+                   help="Actually create filters. Default is dry-run.")
+    p.add_argument("--no-auth-flow", action="store_true",
+                   help="Exit with an error instead of opening a browser if interactive auth is needed. Use this in cron.")
+    return p.parse_args()
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--apply", action="store_true", help="Actually create filters (default: dry-run).")
-    args = p.parse_args()
+    args = parse_args()
+
+    senders_csv = os.path.join(args.output_dir, "senders.csv")
+    diff_csv = os.path.join(args.output_dir, "diff.csv")
 
     print("Authenticating...", file=sys.stderr)
-    svc = authenticate()
+    svc = authenticate(args.credentials, args.token, allow_browser_flow=not args.no_auth_flow)
 
-    print(f"Looking up '{LABEL_NAME}' label...", file=sys.stderr)
-    label_id = find_label_id(svc, LABEL_NAME)
+    print(f"Looking up '{args.label}' label...", file=sys.stderr)
+    label_id = find_label_id(svc, args.label)
     print(f"  label id: {label_id}", file=sys.stderr)
 
-    print(f"Fetching messages with label in {TIME_WINDOW}...", file=sys.stderr)
-    senders = fetch_senders(svc, label_id)
+    print(f"Fetching messages with label in {args.window}...", file=sys.stderr)
+    senders = fetch_senders(svc, label_id, args.window)
     print(f"  unique senders: {len(senders)}", file=sys.stderr)
 
     print("Fetching existing filters...", file=sys.stderr)
     filters = fetch_existing_filters(svc)
-    filter_emails = existing_from_emails(filters)
-    print(f"  existing filters: {len(filters)}  (with 'from' addresses: {len(filter_emails)})", file=sys.stderr)
+    exact_emails, domains = collect_filter_targets(filters)
+    print(
+        f"  existing filters: {len(filters)}  "
+        f"(exact emails: {len(exact_emails)}, domains: {len(domains)})",
+        file=sys.stderr,
+    )
 
     missing = []
     covered = []
     for email, info in sorted(senders.items(), key=lambda kv: -kv[1]["count"]):
-        if sender_already_filtered(email, filter_emails):
+        if is_sender_filtered(email, exact_emails, domains):
             covered.append(info)
         else:
             missing.append(info)
 
-    with open(SENDERS_CSV, "w", newline="") as f:
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    with open(senders_csv, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["email", "count", "sample_subject", "has_filter"])
         for info in sorted(senders.values(), key=lambda i: -i["count"]):
-            has = sender_already_filtered(info["email"], filter_emails)
+            has = is_sender_filtered(info["email"], exact_emails, domains)
             w.writerow([info["email"], info["count"], info["sample_subject"], "yes" if has else "no"])
 
-    with open(DIFF_CSV, "w", newline="") as f:
+    with open(diff_csv, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["email", "count", "sample_subject"])
         for info in missing:
@@ -216,8 +267,8 @@ def main():
     print(f"Senders WITH existing filter:    {len(covered)}")
     print(f"Senders WITHOUT a filter:        {len(missing)}")
     print()
-    print(f"  Full sender list:  {SENDERS_CSV}")
-    print(f"  Filter candidates: {DIFF_CSV}")
+    print(f"  Full sender list:  {senders_csv}")
+    print(f"  Filter candidates: {diff_csv}")
     print()
 
     if not missing:
@@ -231,7 +282,7 @@ def main():
             print(f"  [{info['count']:>3}] {info['email']}  ({info['sample_subject'][:60]})")
         return
 
-    print(f"Creating {len(missing)} filters: apply '{LABEL_NAME}' + skip inbox...")
+    print(f"Creating {len(missing)} filters: apply '{args.label}' + skip inbox...")
     created = 0
     errors = 0
     for info in missing:

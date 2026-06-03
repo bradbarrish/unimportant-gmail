@@ -91,36 +91,57 @@ When you're ready to actually create the filters:
 
 You can re-run any time — the script is idempotent. It only creates filters for senders it can't find an existing match for.
 
-## Customizing
+## CLI options
 
-Edit the constants at the top of `gmail_filters.py`:
+```text
+--label LABEL          Label name to scan. Default: '↓ Unimportant'
+--window WINDOW        Gmail search window. Default: 'newer_than:14d'
+--credentials PATH     OAuth client JSON. Default: ./credentials.json
+--token PATH           Cached token JSON. Default: ./token.json
+--output-dir DIR       Where senders.csv and diff.csv land. Default: script dir
+--apply                Actually create filters (default is dry-run).
+--no-auth-flow         Exit with an error instead of opening a browser if interactive
+                       auth is needed. Use this in cron.
+```
 
-- `LABEL_NAME` — the label whose senders you want to filter on. Default: `↓ Unimportant`. Use any label you've created.
-- `TIME_WINDOW` — Gmail search syntax for how far back to look. Default: `newer_than:14d`.
+The filter action — `apply LABEL + remove INBOX` — is hardcoded. If you want different behavior (delete on arrival, archive without label, apply a different label), edit the `create_filter` function. It's a one-line dict.
 
-The filter action is hardcoded to `apply LABEL + remove INBOX`. If you want different behavior (e.g. delete on arrival, archive without label, apply a different label), edit the `create_filter` function — it's a one-line dict.
+## Tests
+
+```sh
+.venv/bin/python test_gmail_filters.py
+```
+
+The tests cover the filter-criterion parser and the sender-matching logic. These are the parts of the code where a subtle bug can cause the script to silently skip filters that should be created. If you touch `parse_from_criterion` or `is_sender_filtered`, run the tests.
 
 ## How sender matching works
 
-A sender is "already filtered" if **any** of the following appears in the `from:` criterion of an existing filter:
+The script parses every existing filter's `from:` criterion into two sets:
 
-- their exact email address
-- their full domain (e.g. `acme.com`)
-- the `@acme.com` form
+- **Exact emails** — addresses where the local part is significant (e.g. `billing@example.com`).
+- **Domains** — domains where any sender at that domain is covered (e.g. `example.com`, written as `@example.com` or bare `example.com` in the filter).
 
-This means a single domain-level filter like `from:@acme.com` correctly covers every per-campaign tracking address Acme sends from (`promo+abc123@acme.com`, `newsletter+def456@acme.com`, etc.). Without this normalization the script would loop forever trying to create per-campaign filters.
+A sender from your `↓ Unimportant` label counts as "already filtered" if its exact address is in the exact-email set, **or** its domain is in the domain set.
+
+Crucially, an exact-address filter like `billing@example.com` **does not** cover `alerts@example.com`. You'd want it to skip a real candidate only when you've explicitly created a domain filter for the whole company.
+
+The parser handles `OR` (any case), curly-brace groups (`{a@x.com b@y.com}`), parens, quoted values, and negative terms.
 
 ## Running on a schedule (headless / always-on box)
 
 The script works fine under cron. Example: daily at 6am on Linux, pulling latest code from git first.
 
 ```cron
-0 6 * * * cd /home/you/gmail-filters && (echo "=== $(date) ===" && /usr/bin/git pull --quiet && /home/you/gmail-filters/.venv/bin/python gmail_filters.py --apply) >> /home/you/gmail-filters/run.log 2>&1
+0 6 * * * cd /home/you/gmail-filters && (echo "=== $(date) ===" && /usr/bin/git pull --quiet && /home/you/gmail-filters/.venv/bin/python gmail_filters.py --apply --no-auth-flow) >> /home/you/gmail-filters/run.log 2>&1
 ```
+
+`--no-auth-flow` matters: if the refresh token ever becomes invalid, the default behavior is to open a browser to re-authenticate, which would just hang under cron. With the flag, the script exits with an error and you'll see it in the log.
 
 For a headless box, do the OAuth dance once on a machine with a browser, then copy `token.json` over. The refresh token works on any machine until you explicitly revoke it.
 
 If the script ever fails to refresh, it most likely means your OAuth consent screen is still in **Testing** mode and Google has expired the refresh token (this can happen if the app sits unused). Re-run interactively to mint a new one, or push the consent screen to **In production** to avoid expiry.
+
+Transient API failures (429 rate limits, 5xx responses) are automatically retried with exponential backoff before bubbling up.
 
 ## What never gets committed
 
