@@ -46,7 +46,7 @@ Open <https://console.cloud.google.com/apis/library/gmail.googleapis.com>, make 
 Open <https://console.cloud.google.com/apis/credentials/consent>.
 
 - User type: **External**
-- App name: anything (e.g. `gmail-filters`)
+- App name: anything (e.g. `unimportant-gmail`)
 - User support email: your own
 - Developer contact: your own
 - Scopes: leave empty — the script declares them at runtime
@@ -59,7 +59,7 @@ You can leave the app in **Testing** mode. You don't need to publish it.
 Open <https://console.cloud.google.com/apis/credentials>, then **Create Credentials → OAuth client ID**.
 
 - Application type: **Desktop app**
-- Name: anything (e.g. `gmail-filters CLI`)
+- Name: anything (e.g. `unimportant-gmail CLI`)
 - Click **Create**, then **Download JSON**
 
 ### 5. Save the JSON
@@ -76,7 +76,7 @@ python3 -m venv .venv
 ## First run
 
 ```sh
-.venv/bin/python gmail_filters.py
+.venv/bin/python unimportant_gmail.py
 ```
 
 This is a dry run. The first time, your browser will pop open for OAuth — pick the Google account you added as a test user, click through the "Google hasn't verified this app" warning (it's your own app), and grant the scopes. A refresh token will be cached to `token.json` so subsequent runs are non-interactive.
@@ -86,7 +86,7 @@ You'll get a report showing how many candidate senders the script found. Look at
 When you're ready to actually create the filters:
 
 ```sh
-.venv/bin/python gmail_filters.py --apply
+.venv/bin/python unimportant_gmail.py --apply
 ```
 
 You can re-run any time — the script is idempotent. It only creates filters for senders it can't find an existing match for.
@@ -109,7 +109,7 @@ The filter action — `apply LABEL + remove INBOX` — is hardcoded. If you want
 ## Tests
 
 ```sh
-.venv/bin/python test_gmail_filters.py
+.venv/bin/python test_unimportant_gmail.py
 ```
 
 The tests cover the filter-criterion parser and the sender-matching logic. These are the parts of the code where a subtle bug can cause the script to silently skip filters that should be created. If you touch `parse_from_criterion` or `is_sender_filtered`, run the tests.
@@ -132,7 +132,7 @@ The parser handles `OR` (any case), curly-brace groups (`{a@x.com b@y.com}`), pa
 The script works fine under cron. Example: daily at 6am on Linux, pulling latest code from git first.
 
 ```cron
-0 6 * * * cd /home/you/gmail-filters && (echo "=== $(date) ===" && /usr/bin/git pull --quiet && /home/you/gmail-filters/.venv/bin/python gmail_filters.py --apply --no-auth-flow) >> /home/you/gmail-filters/run.log 2>&1
+0 6 * * * cd /home/you/unimportant-gmail && (echo "=== $(date) ===" && /usr/bin/git pull --quiet && /home/you/unimportant-gmail/.venv/bin/python unimportant_gmail.py --apply --no-auth-flow) >> /home/you/unimportant-gmail/run.log 2>&1
 ```
 
 `--no-auth-flow` matters: if the refresh token ever becomes invalid, the default behavior is to open a browser to re-authenticate, which would just hang under cron. With the flag, the script exits with an error and you'll see it in the log.

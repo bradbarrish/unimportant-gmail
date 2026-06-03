@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from gmail_filters import is_sender_filtered, parse_from_criterion
+from unimportant_gmail import is_sender_filtered, parse_from_criterion
 
 _failures = 0
 
