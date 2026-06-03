@@ -1,4 +1,4 @@
-# gmail-filters
+# Unimportant Gamil
 
 A learning loop for keeping your Gmail inbox personal-only.
 
