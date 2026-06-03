@@ -1,87 +1,135 @@
 # gmail-filters
 
-Auto-create Gmail filters for the senders you've been quietly burying.
+A learning loop for keeping your Gmail inbox personal-only.
 
-If you label noisy mail with something like `↓ Unimportant` and then often realize you'd rather just never see it again, this script does the bookkeeping: it finds every sender of recently-labeled mail that doesn't already have a filter, and creates one that applies the label and skips the inbox going forward.
+If you label noise — either with a manual click or via a catch-all filter — this script turns that label into a permanent Gmail filter. The next time the same sender shows up, Gmail handles it before you ever see it.
 
-## What it does
+## The idea
 
-1. Authenticates to Gmail via OAuth (read-only mail + filter management scopes).
-2. Fetches every message under a chosen label in the last 14 days and dedupes the senders.
+Most inboxes are ~98% bulk: newsletters, receipts, marketing, notifications, automated mail. If you want only personal email in your inbox, you have to filter aggressively. Doing that by hand at scale is exhausting. This script automates the loop:
+
+1. You designate a label as "this should never reach my inbox" — by default `↓ Unimportant`.
+2. Anything that lands with that label (whether you applied it manually, or a catch-all filter did) gets noticed.
+3. The script reads your existing filters and figures out which of those senders are not yet filtered.
+4. With `--apply`, it creates a Gmail filter for each missing sender so it skips the inbox in future.
+
+Over time the inbox quiets down, and the only things still landing in it are senders you genuinely want to hear from.
+
+## What the script does
+
+1. Authenticates to Gmail via OAuth (read messages + manage filters scopes).
+2. Pulls every message under the chosen label in the last 14 days and dedupes the senders.
 3. Lists your existing filters and extracts the addresses + domains they target.
-4. Diffs the two — anything in (1) that isn't matched by (3) is a candidate.
-5. By default it prints a report and writes two CSVs (`senders.csv`, `diff.csv`). With `--apply`, it creates a Gmail filter for each candidate:
-   - `from:` the sender's email
-   - apply your label, remove `INBOX`
+4. Diffs (2) against (3). Anything not already covered is a candidate.
+5. Writes a report and two CSVs (`senders.csv`, `diff.csv`). With `--apply`, creates a new Gmail filter for each candidate that applies the label and removes `INBOX`.
 
-## Setup
+## Prerequisites
 
-You'll need a Google Cloud OAuth client (one-time, free).
+- Python 3.10 or newer
+- A Google account with the Gmail you want to manage
+- The label you want to filter into already exists in your Gmail (default: `↓ Unimportant`)
 
-1. **Create / select a project:** <https://console.cloud.google.com>
-2. **Enable the Gmail API:** <https://console.cloud.google.com/apis/library/gmail.googleapis.com>
-3. **Configure the OAuth consent screen:**
-   - User type: External
-   - Add your Google account as a Test User
-4. **Create credentials:** APIs & Services → Credentials → Create → OAuth client ID → **Desktop app**. Download the JSON.
-5. **Drop the JSON in this directory as `credentials.json`**.
+## One-time Google Cloud setup
 
-Then:
+Gmail requires an OAuth client. This is free and takes about five minutes.
+
+### 1. Create or select a project
+
+Go to <https://console.cloud.google.com>. Use any existing project, or click the project picker in the top bar and choose **New Project**. Name it whatever you want.
+
+### 2. Enable the Gmail API
+
+Open <https://console.cloud.google.com/apis/library/gmail.googleapis.com>, make sure your project is selected, and click **Enable**.
+
+### 3. Configure the OAuth consent screen
+
+Open <https://console.cloud.google.com/apis/credentials/consent>.
+
+- User type: **External**
+- App name: anything (e.g. `gmail-filters`)
+- User support email: your own
+- Developer contact: your own
+- Scopes: leave empty — the script declares them at runtime
+- Test users: **add the Google account whose Gmail you want to filter**. Without this step you'll hit "access blocked" during OAuth.
+
+You can leave the app in **Testing** mode. You don't need to publish it.
+
+### 4. Create OAuth client credentials
+
+Open <https://console.cloud.google.com/apis/credentials>, then **Create Credentials → OAuth client ID**.
+
+- Application type: **Desktop app**
+- Name: anything (e.g. `gmail-filters CLI`)
+- Click **Create**, then **Download JSON**
+
+### 5. Save the JSON
+
+Move the downloaded file into this directory and rename it to `credentials.json`. It is git-ignored.
+
+## Install
 
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-## Usage
+## First run
 
 ```sh
-# Dry run — report only, no changes
 .venv/bin/python gmail_filters.py
+```
 
-# Actually create the missing filters
+This is a dry run. The first time, your browser will pop open for OAuth — pick the Google account you added as a test user, click through the "Google hasn't verified this app" warning (it's your own app), and grant the scopes. A refresh token will be cached to `token.json` so subsequent runs are non-interactive.
+
+You'll get a report showing how many candidate senders the script found. Look at `senders.csv` and `diff.csv` to sanity-check.
+
+When you're ready to actually create the filters:
+
+```sh
 .venv/bin/python gmail_filters.py --apply
 ```
 
-The first run opens a browser for OAuth and caches the refresh token to `token.json`. Subsequent runs are non-interactive.
+You can re-run any time — the script is idempotent. It only creates filters for senders it can't find an existing match for.
 
-## Outputs
-
-- `senders.csv` — every sender from the labeled window, with message counts and whether a filter already covers them.
-- `diff.csv` — just the candidates that would be filtered on `--apply`.
-- `run.log` — when invoked from cron, you'll typically redirect here.
-
-## Configuration
+## Customizing
 
 Edit the constants at the top of `gmail_filters.py`:
 
-- `LABEL_NAME` — the label whose senders you want to auto-filter. Default: `↓ Unimportant`.
-- `TIME_WINDOW` — Gmail search-style window for how far back to look. Default: `newer_than:14d`.
+- `LABEL_NAME` — the label whose senders you want to filter on. Default: `↓ Unimportant`. Use any label you've created.
+- `TIME_WINDOW` — Gmail search syntax for how far back to look. Default: `newer_than:14d`.
 
-## Sender matching
+The filter action is hardcoded to `apply LABEL + remove INBOX`. If you want different behavior (e.g. delete on arrival, archive without label, apply a different label), edit the `create_filter` function — it's a one-line dict.
 
-A sender is considered "already filtered" if:
+## How sender matching works
 
-- their exact email address appears in any existing filter's `from:` criterion, **or**
-- their domain (e.g. `acme.com`) appears as a bare domain or `@acme.com` in any existing filter
+A sender is "already filtered" if **any** of the following appears in the `from:` criterion of an existing filter:
 
-This means a single domain filter like `from:@acme.com` correctly covers every per-campaign tracking address Acme sends from.
+- their exact email address
+- their full domain (e.g. `acme.com`)
+- the `@acme.com` form
 
-## Running on a schedule
+This means a single domain-level filter like `from:@acme.com` correctly covers every per-campaign tracking address Acme sends from (`promo+abc123@acme.com`, `newsletter+def456@acme.com`, etc.). Without this normalization the script would loop forever trying to create per-campaign filters.
 
-Example cron entry on a Linux box, daily at 6am:
+## Running on a schedule (headless / always-on box)
+
+The script works fine under cron. Example: daily at 6am on Linux, pulling latest code from git first.
 
 ```cron
 0 6 * * * cd /home/you/gmail-filters && (echo "=== $(date) ===" && /usr/bin/git pull --quiet && /home/you/gmail-filters/.venv/bin/python gmail_filters.py --apply) >> /home/you/gmail-filters/run.log 2>&1
 ```
 
-For a headless box, copy `token.json` from a machine where you've already done the OAuth dance (the refresh token works anywhere).
+For a headless box, do the OAuth dance once on a machine with a browser, then copy `token.json` over. The refresh token works on any machine until you explicitly revoke it.
 
-## Files that should never be committed
+If the script ever fails to refresh, it most likely means your OAuth consent screen is still in **Testing** mode and Google has expired the refresh token (this can happen if the app sits unused). Re-run interactively to mint a new one, or push the consent screen to **In production** to avoid expiry.
 
-`.gitignore` already excludes them, but for the record:
+## What never gets committed
+
+The included `.gitignore` excludes:
 
 - `credentials.json` — OAuth client secret
 - `token.json` — your access + refresh tokens
 - `senders.csv`, `diff.csv` — contain sender email addresses
 - `run.log` — same
+- `.venv/`
+
+If you're forking this repo, keep these excluded.
