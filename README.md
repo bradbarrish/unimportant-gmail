@@ -1,4 +1,4 @@
-# Unimportant Gamil
+# Unimportant Gmail
 
 A learning loop for keeping your Gmail inbox personal-only.
 
