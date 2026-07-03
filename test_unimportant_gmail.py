@@ -2,159 +2,139 @@
 
 import os
 import sys
+import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from unimportant_gmail import is_sender_filtered, parse_from_criterion
-
-_failures = 0
-
-
-def _expect(label, got, want):
-    global _failures
-    if got == want:
-        print(f"  PASS  {label}")
-    else:
-        _failures += 1
-        print(f"  FAIL  {label}")
-        print(f"        got:  {got!r}")
-        print(f"        want: {want!r}")
+from unimportant_gmail import (
+    METADATA_BATCH_SIZE,
+    fetch_message_metadata,
+    is_sender_filtered,
+    parse_from_criterion,
+)
 
 
-def test_empty():
-    e, d = parse_from_criterion("")
-    _expect("empty string -> empty sets", (e, d), (set(), set()))
+class FakeGetRequest:
+    def __init__(self, message_id):
+        self.message_id = message_id
 
-    e, d = parse_from_criterion("    ")
-    _expect("whitespace -> empty sets", (e, d), (set(), set()))
-
-
-def test_exact_email():
-    e, d = parse_from_criterion("billing@example.com")
-    _expect("exact email -> only exact set", (e, d), ({"billing@example.com"}, set()))
-
-
-def test_at_domain():
-    e, d = parse_from_criterion("@example.com")
-    _expect("@domain -> only domain set", (e, d), (set(), {"example.com"}))
+    def execute(self):
+        return {
+            "id": self.message_id,
+            "payload": {
+                "headers": [
+                    {"name": "From", "value": f"{self.message_id}@example.com"},
+                    {"name": "Subject", "value": self.message_id},
+                ]
+            },
+        }
 
 
-def test_bare_domain():
-    e, d = parse_from_criterion("example.com")
-    _expect("bare domain -> only domain set", (e, d), (set(), {"example.com"}))
+class FakeMessages:
+    def get(self, userId, id, format, metadataHeaders):
+        return FakeGetRequest(id)
 
 
-def test_or_uppercase():
-    e, d = parse_from_criterion("a@x.com OR b@y.com")
-    _expect("OR (uppercase)", (e, d), ({"a@x.com", "b@y.com"}, set()))
+class FakeUsers:
+    def messages(self):
+        return FakeMessages()
 
 
-def test_or_lowercase():
-    e, d = parse_from_criterion("a@x.com or b@y.com")
-    _expect("OR (lowercase)", (e, d), ({"a@x.com", "b@y.com"}, set()))
+class FakeBatch:
+    def __init__(self, service, callback):
+        self.service = service
+        self.callback = callback
+        self.requests = []
+
+    def add(self, request, request_id):
+        self.requests.append((request_id, request))
+
+    def execute(self):
+        self.service.batch_sizes.append(len(self.requests))
+        for request_id, request in self.requests:
+            self.callback(request_id, request.execute(), None)
 
 
-def test_curly_braces():
-    e, d = parse_from_criterion("{a@x.com b@y.com}")
-    _expect("curly braces", (e, d), ({"a@x.com", "b@y.com"}, set()))
+class FakeService:
+    def __init__(self):
+        self.batch_sizes = []
+
+    def users(self):
+        return FakeUsers()
+
+    def new_batch_http_request(self, callback):
+        return FakeBatch(self, callback)
 
 
-def test_parens_or():
-    e, d = parse_from_criterion("(a@x.com OR b@y.com)")
-    _expect("parens + OR", (e, d), ({"a@x.com", "b@y.com"}, set()))
+class FilterCriterionParsingTest(unittest.TestCase):
+    def test_empty(self):
+        self.assertEqual(parse_from_criterion(""), (set(), set()))
+        self.assertEqual(parse_from_criterion("    "), (set(), set()))
+
+    def test_exact_email(self):
+        self.assertEqual(parse_from_criterion("billing@example.com"), ({"billing@example.com"}, set()))
+
+    def test_at_domain(self):
+        self.assertEqual(parse_from_criterion("@example.com"), (set(), {"example.com"}))
+
+    def test_bare_domain(self):
+        self.assertEqual(parse_from_criterion("example.com"), (set(), {"example.com"}))
+
+    def test_or_terms(self):
+        self.assertEqual(parse_from_criterion("a@x.com OR b@y.com"), ({"a@x.com", "b@y.com"}, set()))
+        self.assertEqual(parse_from_criterion("a@x.com or b@y.com"), ({"a@x.com", "b@y.com"}, set()))
+
+    def test_grouping_and_quotes(self):
+        self.assertEqual(parse_from_criterion("{a@x.com b@y.com}"), ({"a@x.com", "b@y.com"}, set()))
+        self.assertEqual(parse_from_criterion("(a@x.com OR b@y.com)"), ({"a@x.com", "b@y.com"}, set()))
+        self.assertEqual(parse_from_criterion('"someone@example.com"'), ({"someone@example.com"}, set()))
+        self.assertEqual(parse_from_criterion("'someone@example.com'"), ({"someone@example.com"}, set()))
+
+    def test_negative_terms(self):
+        self.assertEqual(parse_from_criterion("-billing@example.com"), (set(), set()))
+
+    def test_mixed(self):
+        self.assertEqual(
+            parse_from_criterion("@toast.com OR billing@example.com OR shop.com"),
+            ({"billing@example.com"}, {"toast.com", "shop.com"}),
+        )
+
+    def test_case_normalization(self):
+        self.assertEqual(parse_from_criterion("Billing@EXAMPLE.com"), ({"billing@example.com"}, set()))
 
 
-def test_quoted_values():
-    e, d = parse_from_criterion('"someone@example.com"')
-    _expect("double-quoted", (e, d), ({"someone@example.com"}, set()))
+class SenderMatchingTest(unittest.TestCase):
+    def test_sender_matching_exact_only(self):
+        exact = {"billing@example.com"}
+        domains = set()
+        self.assertTrue(is_sender_filtered("billing@example.com", exact, domains))
+        self.assertFalse(is_sender_filtered("alerts@example.com", exact, domains))
 
-    e, d = parse_from_criterion("'someone@example.com'")
-    _expect("single-quoted", (e, d), ({"someone@example.com"}, set()))
+    def test_sender_matching_domain(self):
+        exact = set()
+        domains = {"example.com"}
+        self.assertTrue(is_sender_filtered("alerts@example.com", exact, domains))
+        self.assertTrue(is_sender_filtered("billing+abc@example.com", exact, domains))
+        self.assertFalse(is_sender_filtered("alerts@other.com", exact, domains))
 
-
-def test_negative_terms():
-    e, d = parse_from_criterion("-billing@example.com")
-    _expect("negative -> dropped", (e, d), (set(), set()))
-
-
-def test_mixed():
-    e, d = parse_from_criterion("@toast.com OR billing@example.com OR shop.com")
-    _expect(
-        "mixed exact + @domain + bare-domain",
-        (e, d),
-        ({"billing@example.com"}, {"toast.com", "shop.com"}),
-    )
-
-
-def test_case_normalization():
-    e, d = parse_from_criterion("Billing@EXAMPLE.com")
-    _expect("case normalized -> lowercase", (e, d), ({"billing@example.com"}, set()))
+    def test_sender_matching_both(self):
+        exact = {"vip@partner.com"}
+        domains = {"newsletter.com"}
+        self.assertTrue(is_sender_filtered("vip@partner.com", exact, domains))
+        self.assertTrue(is_sender_filtered("anyone@newsletter.com", exact, domains))
+        self.assertFalse(is_sender_filtered("anyone@partner.com", exact, domains))
 
 
-def test_sender_matching_exact_only():
-    # The high-severity bug: an exact-address filter must NOT cover other addresses at the same domain.
-    exact = {"billing@example.com"}
-    domains = set()
-    _expect(
-        "exact filter covers exact address",
-        is_sender_filtered("billing@example.com", exact, domains),
-        True,
-    )
-    _expect(
-        "exact filter does NOT cover sibling address",
-        is_sender_filtered("alerts@example.com", exact, domains),
-        False,
-    )
+class MessageMetadataFetchTest(unittest.TestCase):
+    def test_fetch_message_metadata_chunks_large_pages(self):
+        svc = FakeService()
+        message_ids = [f"m{i}" for i in range(METADATA_BATCH_SIZE + 1)]
 
+        metadata = fetch_message_metadata(svc, message_ids)
 
-def test_sender_matching_domain():
-    exact = set()
-    domains = {"example.com"}
-    _expect(
-        "domain filter covers any address at that domain",
-        is_sender_filtered("alerts@example.com", exact, domains),
-        True,
-    )
-    _expect(
-        "domain filter covers plus-addressed sender",
-        is_sender_filtered("billing+abc@example.com", exact, domains),
-        True,
-    )
-    _expect(
-        "domain filter does not leak to other domains",
-        is_sender_filtered("alerts@other.com", exact, domains),
-        False,
-    )
-
-
-def test_sender_matching_both():
-    exact = {"vip@partner.com"}
-    domains = {"newsletter.com"}
-    _expect(
-        "exact wins for exact match",
-        is_sender_filtered("vip@partner.com", exact, domains),
-        True,
-    )
-    _expect(
-        "domain match still works",
-        is_sender_filtered("anyone@newsletter.com", exact, domains),
-        True,
-    )
-    _expect(
-        "no match at all",
-        is_sender_filtered("anyone@partner.com", exact, domains),
-        False,
-    )
+        self.assertEqual([item["id"] for item in metadata], message_ids)
+        self.assertEqual(svc.batch_sizes, [METADATA_BATCH_SIZE, 1])
 
 
 if __name__ == "__main__":
-    print("Running tests...\n")
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            print(f"-- {name} --")
-            fn()
-    print()
-    if _failures:
-        print(f"{_failures} test assertion(s) failed.")
-        sys.exit(1)
-    print("All tests passed.")
+    unittest.main(verbosity=2)

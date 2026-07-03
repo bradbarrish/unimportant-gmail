@@ -17,7 +17,6 @@ from googleapiclient.errors import HttpError
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.settings.basic",
-    "https://www.googleapis.com/auth/gmail.labels",
 ]
 
 DEFAULT_LABEL = "↓ Unimportant"
@@ -28,6 +27,7 @@ DEFAULT_CREDS = os.path.join(HERE, "credentials.json")
 DEFAULT_TOKEN = os.path.join(HERE, "token.json")
 
 RETRY_STATUSES = {429, 500, 502, 503, 504}
+METADATA_BATCH_SIZE = 100
 
 
 def _retry(call, max_attempts=5, base_delay=1.0):
@@ -63,8 +63,10 @@ def authenticate(creds_path, token_path, allow_browser_flow=True):
                 )
             flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
             creds = flow.run_local_server(port=0)
-        with open(token_path, "w") as f:
+        os.makedirs(os.path.dirname(os.path.abspath(token_path)), exist_ok=True)
+        with open(token_path, "w", encoding="utf-8") as f:
             f.write(creds.to_json())
+        os.chmod(token_path, 0o600)
     return build("gmail", "v1", credentials=creds)
 
 
@@ -150,16 +152,12 @@ def fetch_senders(svc, label_id, window):
             ).execute()
         )
         msgs = resp.get("messages", [])
-        for m in msgs:
-            full = _retry(
-                lambda mid=m["id"]: svc.users().messages().get(
-                    userId="me",
-                    id=mid,
-                    format="metadata",
-                    metadataHeaders=["From", "Subject"],
-                ).execute()
-            )
-            headers = {h["name"]: h["value"] for h in full.get("payload", {}).get("headers", [])}
+        message_ids = [m["id"] for m in msgs]
+        for full in fetch_message_metadata(svc, message_ids):
+            headers = {
+                h["name"]: h["value"]
+                for h in full.get("payload", {}).get("headers", [])
+            }
             _, addr = parseaddr(headers.get("From", ""))
             if not addr or "@" not in addr:
                 continue
@@ -177,6 +175,60 @@ def fetch_senders(svc, label_id, window):
         if not page_token:
             break
     return senders
+
+
+def fetch_message_metadata(svc, message_ids):
+    """Fetch From/Subject metadata for message_ids using Gmail batch requests."""
+    if not message_ids:
+        return []
+
+    out = []
+    for start in range(0, len(message_ids), METADATA_BATCH_SIZE):
+        chunk = message_ids[start:start + METADATA_BATCH_SIZE]
+        responses = {}
+        errors = {}
+
+        def callback(request_id, response, exception):
+            if exception is None:
+                responses[request_id] = response or {}
+            else:
+                errors[request_id] = exception
+
+        def execute_batch():
+            responses.clear()
+            errors.clear()
+            batch = svc.new_batch_http_request(callback=callback)
+            for message_id in chunk:
+                batch.add(
+                    svc.users().messages().get(
+                        userId="me",
+                        id=message_id,
+                        format="metadata",
+                        metadataHeaders=["From", "Subject"],
+                    ),
+                    request_id=message_id,
+                )
+            return batch.execute()
+
+        _retry(execute_batch)
+
+        for message_id, error in errors.items():
+            status = getattr(getattr(error, "resp", None), "status", None)
+            if isinstance(error, HttpError) and status in RETRY_STATUSES:
+                responses[message_id] = _retry(
+                    lambda mid=message_id: svc.users().messages().get(
+                        userId="me",
+                        id=mid,
+                        format="metadata",
+                        metadataHeaders=["From", "Subject"],
+                    ).execute()
+                )
+            else:
+                raise error
+
+        out.extend(responses[message_id] for message_id in chunk if message_id in responses)
+
+    return out
 
 
 def fetch_existing_filters(svc):
@@ -217,6 +269,8 @@ def parse_args():
 def main():
     args = parse_args()
 
+    os.makedirs(args.output_dir, exist_ok=True)
+
     senders_csv = os.path.join(args.output_dir, "senders.csv")
     diff_csv = os.path.join(args.output_dir, "diff.csv")
 
@@ -248,16 +302,14 @@ def main():
         else:
             missing.append(info)
 
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    with open(senders_csv, "w", newline="") as f:
+    with open(senders_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["email", "count", "sample_subject", "has_filter"])
         for info in sorted(senders.values(), key=lambda i: -i["count"]):
             has = is_sender_filtered(info["email"], exact_emails, domains)
             w.writerow([info["email"], info["count"], info["sample_subject"], "yes" if has else "no"])
 
-    with open(diff_csv, "w", newline="") as f:
+    with open(diff_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["email", "count", "sample_subject"])
         for info in missing:
