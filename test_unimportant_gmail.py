@@ -5,7 +5,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from unimportant_gmail import is_sender_filtered, parse_from_criterion
+from unimportant_gmail import (
+    collect_filter_targets,
+    filter_criteria_for_senders,
+    is_sender_filtered,
+    parse_from_criterion,
+    parse_query_criterion,
+)
 
 _failures = 0
 
@@ -144,6 +150,48 @@ def test_sender_matching_both():
         "no match at all",
         is_sender_filtered("anyone@partner.com", exact, domains),
         False,
+    )
+
+
+def test_query_from_terms():
+    e, d = parse_query_criterion("{from:a@x.com from:b@y.com}")
+    _expect("query grouped from terms", (e, d), ({"a@x.com", "b@y.com"}, set()))
+
+    e, d = parse_query_criterion("from:(a@x.com OR b@y.com)")
+    _expect("query from parens", (e, d), ({"a@x.com", "b@y.com"}, set()))
+
+    e, d = parse_query_criterion("from:@example.com")
+    _expect("query from domain", (e, d), (set(), {"example.com"}))
+
+
+def test_query_ignores_unscoped_email():
+    e, d = parse_query_criterion("a@x.com OR from:b@y.com")
+    _expect("query ignores bare email body text", (e, d), ({"b@y.com"}, set()))
+
+
+def test_collect_filter_targets_includes_query():
+    filters = [
+        {"criteria": {"from": "billing@example.com"}},
+        {"criteria": {"query": "{from:a@x.com from:b@y.com}"}},
+    ]
+    e, d = collect_filter_targets(filters)
+    _expect(
+        "collect exact from and query criteria",
+        (e, d),
+        ({"billing@example.com", "a@x.com", "b@y.com"}, set()),
+    )
+
+
+def test_filter_criteria_for_senders():
+    _expect(
+        "single sender uses from criteria",
+        filter_criteria_for_senders(["a@x.com"]),
+        {"from": "a@x.com"},
+    )
+    _expect(
+        "multiple senders use query criteria",
+        filter_criteria_for_senders(["a@x.com", "b@y.com"]),
+        {"query": "{from:a@x.com from:b@y.com}"},
     )
 
 

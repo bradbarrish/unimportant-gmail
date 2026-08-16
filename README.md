@@ -11,7 +11,7 @@ Most inboxes are ~98% bulk: newsletters, receipts, marketing, notifications, aut
 1. You designate a label as "this should never reach my inbox" — by default `↓ Unimportant`.
 2. Anything that lands with that label (whether you applied it manually, or a catch-all filter did) gets noticed.
 3. The script reads your existing filters and figures out which of those senders are not yet filtered.
-4. With `--apply`, it creates a Gmail filter for each missing sender so it skips the inbox in future.
+4. With `--apply`, it creates Gmail filters for missing senders so they skip the inbox in future.
 
 Over time the inbox quiets down, and the only things still landing in it are senders you genuinely want to hear from.
 
@@ -21,7 +21,7 @@ Over time the inbox quiets down, and the only things still landing in it are sen
 2. Pulls every message under the chosen label in the last 14 days and dedupes the senders.
 3. Lists your existing filters and extracts the addresses + domains they target.
 4. Diffs (2) against (3). Anything not already covered is a candidate.
-5. Writes a report and two CSVs (`senders.csv`, `diff.csv`). With `--apply`, creates a new Gmail filter for each candidate that applies the label and removes `INBOX`.
+5. Writes a report and two CSVs (`senders.csv`, `diff.csv`). With `--apply`, creates Gmail filters for candidates that apply the label and remove `INBOX`.
 
 ## Prerequisites
 
@@ -91,6 +91,14 @@ When you're ready to actually create the filters:
 
 You can re-run any time — the script is idempotent. It only creates filters for senders it can't find an existing match for.
 
+By default, new candidates are grouped into Gmail query filters of up to 25 senders each. This avoids hitting Gmail's hard filter-count limit while preserving exact sender matching:
+
+```text
+{from:a@example.com from:b@example.com from:c@example.com}
+```
+
+If you want the older one-filter-per-sender behavior, pass `--group-size 1`.
+
 ## CLI options
 
 ```text
@@ -100,6 +108,8 @@ You can re-run any time — the script is idempotent. It only creates filters fo
 --token PATH           Cached token JSON. Default: ./token.json
 --output-dir DIR       Where senders.csv and diff.csv land. Default: script dir
 --apply                Actually create filters (default is dry-run).
+--group-size N         Group this many missing senders into one Gmail query
+                       filter. Default: 25. Use 1 for one filter per sender.
 --no-auth-flow         Exit with an error instead of opening a browser if interactive
                        auth is needed. Use this in cron.
 ```
@@ -114,9 +124,17 @@ The filter action — `apply LABEL + remove INBOX` — is hardcoded. If you want
 
 The tests cover the filter-criterion parser and the sender-matching logic. These are the parts of the code where a subtle bug can cause the script to silently skip filters that should be created. If you touch `parse_from_criterion` or `is_sender_filtered`, run the tests.
 
+## Gmail filter count limit
+
+Gmail enforces a hard limit on the number of filters in an account. If you create one filter per sender, bulk mail cleanup can eventually hit that limit.
+
+This script reduces filter growth by creating grouped query filters for new senders. A grouped filter still matches exact senders because each term is scoped with `from:`. Existing grouped filters are also parsed when deciding whether a sender is already covered, so re-runs should not create duplicate sender coverage.
+
+Before doing any large-scale deletion or consolidation of existing filters, export or snapshot your current Gmail filters. Gmail filter IDs themselves are not restorable, but equivalent criteria/actions can be recreated from a backup if there is enough filter capacity.
+
 ## How sender matching works
 
-The script parses every existing filter's `from:` criterion into two sets:
+The script parses every existing filter's `from:` criterion, plus explicit `from:` terms in query filters, into two sets:
 
 - **Exact emails** — addresses where the local part is significant (e.g. `billing@example.com`).
 - **Domains** — domains where any sender at that domain is covered (e.g. `example.com`, written as `@example.com` or bare `example.com` in the filter).
@@ -125,7 +143,7 @@ A sender from your `↓ Unimportant` label counts as "already filtered" if its e
 
 Crucially, an exact-address filter like `billing@example.com` **does not** cover `alerts@example.com`. You'd want it to skip a real candidate only when you've explicitly created a domain filter for the whole company.
 
-The parser handles `OR` (any case), curly-brace groups (`{a@x.com b@y.com}`), parens, quoted values, and negative terms.
+The parser handles `OR` (any case), curly-brace groups (`{a@x.com b@y.com}`), parens, quoted values, negative terms, and grouped query filters such as `{from:a@x.com from:b@y.com}`.
 
 ## Running on a schedule (headless / always-on box)
 

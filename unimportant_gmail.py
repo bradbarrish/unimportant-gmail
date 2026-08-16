@@ -107,14 +107,45 @@ def parse_from_criterion(from_val):
     return exact_emails, domains
 
 
+def parse_query_criterion(query_val):
+    """Parse sender coverage from Gmail search query syntax.
+
+    This intentionally extracts only explicit from: terms. A bare email address in
+    a has-the-words query may just be body text, so it should not be treated as a
+    sender filter unless Gmail's search field scopes it with from:.
+    """
+    exact_emails = set()
+    domains = set()
+
+    if not query_val:
+        return exact_emails, domains
+
+    # Handles forms like:
+    #   from:a@example.com
+    #   {from:a@example.com from:b@example.com}
+    #   from:(a@example.com OR b@example.com)
+    #   from:{a@example.com b@example.com}
+    pattern = re.compile(r"from:(\{[^}]+\}|\([^)]+\)|\"[^\"]+\"|'[^']+'|[^\s}]+)", re.I)
+    for match in pattern.finditer(query_val):
+        exact, parsed_domains = parse_from_criterion(match.group(1))
+        exact_emails |= exact
+        domains |= parsed_domains
+
+    return exact_emails, domains
+
+
 def collect_filter_targets(filters):
-    """Aggregate exact emails and domains across every filter's 'from' criterion."""
+    """Aggregate exact emails/domains across filter sender criteria."""
     all_exact = set()
     all_domains = set()
     for f in filters:
-        exact, domains = parse_from_criterion(f.get("criteria", {}).get("from", ""))
+        criteria = f.get("criteria", {})
+        exact, domains = parse_from_criterion(criteria.get("from", ""))
+        query_exact, query_domains = parse_query_criterion(criteria.get("query", ""))
         all_exact |= exact
+        all_exact |= query_exact
         all_domains |= domains
+        all_domains |= query_domains
     return all_exact, all_domains
 
 
@@ -185,14 +216,26 @@ def fetch_existing_filters(svc):
     ).get("filter", [])
 
 
-def create_filter(svc, email, label_id):
+def create_filter(svc, criteria, label_id):
     body = {
-        "criteria": {"from": email},
+        "criteria": criteria,
         "action": {"addLabelIds": [label_id], "removeLabelIds": ["INBOX"]},
     }
     return _retry(
         lambda: svc.users().settings().filters().create(userId="me", body=body).execute()
     )
+
+
+def filter_criteria_for_senders(emails):
+    if len(emails) == 1:
+        return {"from": emails[0]}
+    query = "{" + " ".join(f"from:{email}" for email in emails) + "}"
+    return {"query": query}
+
+
+def chunks(items, size):
+    for idx in range(0, len(items), size):
+        yield items[idx : idx + size]
 
 
 def parse_args():
@@ -209,9 +252,14 @@ def parse_args():
                    help="Where senders.csv and diff.csv are written.")
     p.add_argument("--apply", action="store_true",
                    help="Actually create filters. Default is dry-run.")
+    p.add_argument("--group-size", type=int, default=25,
+                   help="Group this many missing senders into one Gmail query filter. Use 1 for one filter per sender.")
     p.add_argument("--no-auth-flow", action="store_true",
                    help="Exit with an error instead of opening a browser if interactive auth is needed. Use this in cron.")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.group_size < 1:
+        p.error("--group-size must be at least 1")
+    return args
 
 
 def main():
@@ -277,22 +325,30 @@ def main():
 
     if not args.apply:
         print("Dry run. Re-run with --apply to create filters.")
+        planned_filters = len(list(chunks(missing, args.group_size)))
+        print(f"Would create {planned_filters} Gmail filter(s) for {len(missing)} sender(s).")
         print(f"Preview (top 20 of {len(missing)}):")
         for info in missing[:20]:
             print(f"  [{info['count']:>3}] {info['email']}  ({info['sample_subject'][:60]})")
         return
 
-    print(f"Creating {len(missing)} filters: apply '{args.label}' + skip inbox...")
+    groups = list(chunks(missing, args.group_size))
+    print(f"Creating {len(groups)} filters for {len(missing)} senders: apply '{args.label}' + skip inbox...")
     created = 0
     errors = 0
-    for info in missing:
+    for group in groups:
+        emails = [info["email"] for info in group]
         try:
-            create_filter(svc, info["email"], label_id)
+            create_filter(svc, filter_criteria_for_senders(emails), label_id)
             created += 1
-            print(f"  + {info['email']}")
+            if len(emails) == 1:
+                print(f"  + {emails[0]}")
+            else:
+                print(f"  + grouped filter for {len(emails)} senders")
         except HttpError as e:
             errors += 1
-            print(f"  ! {info['email']} :: {e}")
+            label = emails[0] if len(emails) == 1 else f"{len(emails)}-sender group starting {emails[0]}"
+            print(f"  ! {label} :: {e}")
     print()
     print(f"Created: {created}.  Errors: {errors}.")
 
