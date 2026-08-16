@@ -23,6 +23,11 @@ Over time the inbox quiets down, and the only things still landing in it are sen
 4. Diffs (2) against (3). Anything not already covered is a candidate.
 5. Writes a report and two CSVs (`senders.csv`, `diff.csv`). With `--apply`, creates Gmail filters for candidates that apply the label and remove `INBOX`.
 
+## More Documentation
+
+- [Operations runbook](docs/OPERATIONS.md): regular usage, scheduling, rollback, and recovery.
+- [Security notes](docs/SECURITY.md): OAuth token handling, safe commit checks, and Gmail access scope.
+
 ## Prerequisites
 
 - Python 3.10 or newer
@@ -147,7 +152,9 @@ The parser handles `OR` (any case), curly-brace groups (`{a@x.com b@y.com}`), pa
 
 ## Running on a schedule (headless / always-on box)
 
-The script works fine under cron. Example: daily at 6am on Linux, pulling latest code from git first.
+The script works fine under cron or launchd. See [the operations runbook](docs/OPERATIONS.md) for examples, rollback steps, and verification commands.
+
+Example cron entry: daily at 6am on Linux, pulling latest code from git first.
 
 ```cron
 0 6 * * * cd /home/you/unimportant-gmail && (echo "=== $(date) ===" && /usr/bin/git pull --quiet && /home/you/unimportant-gmail/.venv/bin/python unimportant_gmail.py --apply --no-auth-flow) >> /home/you/unimportant-gmail/run.log 2>&1
