@@ -8,9 +8,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from unimportant_gmail import (
     METADATA_BATCH_SIZE,
+    collect_filter_targets,
     fetch_message_metadata,
+    filter_criteria_for_senders,
     is_sender_filtered,
     parse_from_criterion,
+    parse_query_criterion,
 )
 
 
@@ -103,6 +106,28 @@ class FilterCriterionParsingTest(unittest.TestCase):
         self.assertEqual(parse_from_criterion("Billing@EXAMPLE.com"), ({"billing@example.com"}, set()))
 
 
+class QueryCriterionParsingTest(unittest.TestCase):
+    def test_query_from_terms(self):
+        self.assertEqual(
+            parse_query_criterion("{from:a@x.com from:b@y.com}"),
+            ({"a@x.com", "b@y.com"}, set()),
+        )
+        self.assertEqual(
+            parse_query_criterion("from:(a@x.com OR b@y.com)"),
+            ({"a@x.com", "b@y.com"}, set()),
+        )
+        self.assertEqual(
+            parse_query_criterion("from:@example.com"),
+            (set(), {"example.com"}),
+        )
+
+    def test_query_ignores_unscoped_email(self):
+        self.assertEqual(
+            parse_query_criterion("a@x.com OR from:b@y.com"),
+            ({"b@y.com"}, set()),
+        )
+
+
 class SenderMatchingTest(unittest.TestCase):
     def test_sender_matching_exact_only(self):
         exact = {"billing@example.com"}
@@ -134,6 +159,27 @@ class MessageMetadataFetchTest(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in metadata], message_ids)
         self.assertEqual(svc.batch_sizes, [METADATA_BATCH_SIZE, 1])
+
+
+class FilterTargetCollectionTest(unittest.TestCase):
+    def test_collect_filter_targets_includes_query(self):
+        filters = [
+            {"criteria": {"from": "billing@example.com"}},
+            {"criteria": {"query": "{from:a@x.com from:b@y.com}"}},
+        ]
+        self.assertEqual(
+            collect_filter_targets(filters),
+            ({"billing@example.com", "a@x.com", "b@y.com"}, set()),
+        )
+
+
+class FilterCreationCriteriaTest(unittest.TestCase):
+    def test_filter_criteria_for_senders(self):
+        self.assertEqual(filter_criteria_for_senders(["a@x.com"]), {"from": "a@x.com"})
+        self.assertEqual(
+            filter_criteria_for_senders(["a@x.com", "b@y.com"]),
+            {"query": "{from:a@x.com from:b@y.com}"},
+        )
 
 
 if __name__ == "__main__":
